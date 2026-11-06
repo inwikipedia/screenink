@@ -2,15 +2,25 @@
 //! 做法：在 32bpp DIB 上用白色 + 灰度抗锯齿写字，读回 R 通道当作覆盖率，
 //! 再按覆盖率着色，得到可直接参与预乘 alpha 混合的字形位图。
 
+use crate::i18n::Lang;
 use crate::raster::{rgba, Bitmap};
 use std::ffi::c_void;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicU8, Ordering};
 use windows_sys::Win32::Graphics::Gdi::*;
 
 const DEFAULT_CHARSET: u32 = 1;
 const ANTIALIASED_QUALITY: u32 = 4;
 const FW_NORMAL: i32 = 400;
 const TRANSPARENT_MODE: i32 = 1;
+
+/// 当前界面语言对应的字体选择。UI 是单线程消息循环，Relaxed 足够。
+static FONT_LANG: AtomicU8 = AtomicU8::new(Lang::En as u8);
+
+/// 切换语言后同步正文字体（西文 Segoe UI / 简中 YaHei / 繁中 JhengHei / 日语 Yu Gothic）。
+pub fn set_lang_font(lang: Lang) {
+    FONT_LANG.store(lang as u8, Ordering::Relaxed);
+}
 
 pub fn render(text: &str, size: i32, r: u8, g: u8, b: u8) -> Bitmap {
     unsafe {
@@ -40,7 +50,13 @@ pub fn render(text: &str, size: i32, r: u8, g: u8, b: u8) -> Bitmap {
         }
         let dc = CreateCompatibleDC(null_mut());
         SelectObject(dc, hbmp);
-        let face: Vec<u16> = "Microsoft YaHei\0".encode_utf16().collect();
+        // 按当前语言选首选字体；GDI 字体链接会自动补齐首选字体缺失的字形。
+        let lang = Lang::from_u8(FONT_LANG.load(Ordering::Relaxed));
+        let face: Vec<u16> = lang
+            .font_face()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let font = CreateFontW(
             -size, 0, 0, 0, FW_NORMAL, 0, 0, 0,
             DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, face.as_ptr(),
@@ -90,8 +106,9 @@ pub fn render(text: &str, size: i32, r: u8, g: u8, b: u8) -> Bitmap {
 }
 
 /// 多行文本合成一张带半透明底板的提示卡片。
-pub fn card(lines: &[&str], size: i32, pad: i32, line_h: i32) -> Bitmap {
-    let rendered: Vec<Bitmap> = lines.iter().map(|s| render(s, size, 235, 240, 248)).collect();
+/// 泛型入参，既能接静态 `&[&str]`，也能接运行期拼出来的 `Vec<String>`（帮助卡片）。
+pub fn card(lines: &[impl AsRef<str>], size: i32, pad: i32, line_h: i32) -> Bitmap {
+    let rendered: Vec<Bitmap> = lines.iter().map(|s| render(s.as_ref(), size, 235, 240, 248)).collect();
     let mut w = 0;
     for b in &rendered {
         w = w.max(b.w);

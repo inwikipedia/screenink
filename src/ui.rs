@@ -1,5 +1,8 @@
 //! 自绘工具条（全部画在同一个叠层窗口的像素缓冲里，无子控件）。
+//! 所有文案来自 `i18n`，工具条宽度随语言变化，因此按钮按文字实测宽度布局，
+//! 并通过两遍缩放保证德语等较长文案在窄屏上也放得下。
 
+use crate::i18n::{self, Lang};
 use crate::raster::{solid, Bitmap, Canvas, Color};
 use crate::text;
 
@@ -13,7 +16,6 @@ pub const COLORS: [(u8, u8, u8); 8] = [
     (191, 90, 242),  // 紫
     (255, 255, 255), // 白
 ];
-pub const COLOR_NAMES: [&str; 8] = ["红", "橙", "黄", "绿", "青", "蓝", "紫", "白"];
 pub const WIDTHS: [f32; 3] = [2.5, 5.0, 10.0];
 pub const TEXT_SIZES: [i32; 3] = [22, 30, 42];
 
@@ -39,6 +41,8 @@ pub enum Action {
     Save,
     Freeze,
     MouseMode,
+    /// 循环切换界面语言。
+    Lang,
     Help,
     Exit,
 }
@@ -70,6 +74,8 @@ struct Lay {
     x: i32,
     bh: i32,
     gap: i32,
+    /// 文字按钮左右内边距，宽度 = 文字实测宽 + 2*lpad（再取 min_w 下限）。
+    lpad: i32,
     btns: Vec<Btn>,
     fs: i32,
 }
@@ -79,8 +85,10 @@ impl Lay {
         self.btns.push(Btn { x: self.x, y: 0, w, h: self.bh, act, face });
         self.x += w + self.gap;
     }
-    fn label(&mut self, s: &str, w: i32, act: Action) {
+    /// 文字按钮：先渲染位图，再按位图实测宽度定按钮宽（不同语言词长差异很大）。
+    fn label(&mut self, s: &str, min_w: i32, act: Action) {
         let b = text::render(s, self.fs, 240, 245, 252);
+        let w = (b.w + self.lpad * 2).max(min_w);
         self.push(w, act, Face::Label(b));
     }
     fn space(&mut self, d: i32) {
@@ -105,23 +113,50 @@ pub struct Ui {
 impl Ui {
     /// (ox, oy, mon_w, mon_h) 是主显示器在整块虚拟桌面像素缓冲中的位置与尺寸。
     /// 工具条只放在主屏，避免多显示器时被居中到别的屏幕上。
-    pub fn new(ox: i32, oy: i32, mon_w: i32, mon_h: i32) -> Self {
-        let scale = ((mon_w - 32) as f32 / 1240.0).min(1.0).max(0.55);
+    pub fn new(ox: i32, oy: i32, mon_w: i32, mon_h: i32, hotkey_label: &str, lang: Lang) -> Self {
+        // 第一遍：在 scale=1.0 下量出当前语言的自然总宽。
+        let probe = Self::build(ox, oy, mon_w, mon_h, hotkey_label, lang, 1.0);
+        let natural = probe.w.max(1);
+        // 第二遍：按可用宽度反推缩放比，长词语言（德/法等）在窄屏自动整体缩小。
+        let scale = ((mon_w - 32) as f32 / natural as f32).min(1.0).max(0.55);
+        Self::build(ox, oy, mon_w, mon_h, hotkey_label, lang, scale)
+    }
+
+    fn build(
+        ox: i32,
+        oy: i32,
+        mon_w: i32,
+        mon_h: i32,
+        hotkey_label: &str,
+        lang: Lang,
+        scale: f32,
+    ) -> Self {
         let s = |v: i32| -> i32 { (v as f32 * scale).round() as i32 };
-        let fs = if scale > 0.82 { 15 } else { 12 };
+        // 字号随缩放比连续变化：文字实测宽度才能真正跟着 scale 收窄。
+        // 否则长词语言（德 / 西 / 法）即便算出缩放比，文字仍按满字号渲染、照样溢出。
+        let fs = (15.0 * scale).round().clamp(10.0, 15.0) as i32;
+        let help_fs = (15.0 * scale).round().clamp(10.0, 15.0) as i32;
+        let hint_fs = (14.0 * scale).round().clamp(9.0, 14.0) as i32;
         let bh = s(38).max(28);
         let gap = s(6).max(4);
         let pad = s(10).max(7);
         let group = s(14).max(8);
+        let lpad = s(10).max(6);
 
-        let mut l = Lay { x: pad, bh, gap, btns: Vec::new(), fs };
+        let st = i18n::strings(lang);
+        let mut l = Lay { x: pad, bh, gap, lpad, btns: Vec::new(), fs };
 
-        for (i, (lab, tool)) in [
-            ("笔", Tool::Pen), ("线", Tool::Line), ("框", Tool::Rect),
-            ("圆", Tool::Ellipse), ("箭", Tool::Arrow), ("字", Tool::Text),
-            ("擦", Tool::Eraser),
-        ].iter().enumerate() {
-            let _ = i;
+        // 七种工具，顺序与 Tool 枚举一致。
+        let tool_acts = [
+            Tool::Pen,
+            Tool::Line,
+            Tool::Rect,
+            Tool::Ellipse,
+            Tool::Arrow,
+            Tool::Text,
+            Tool::Eraser,
+        ];
+        for (lab, tool) in st.tools.iter().zip(tool_acts.iter()) {
             l.label(lab, s(38), Action::Tool(*tool));
         }
         l.space(group - gap);
@@ -137,13 +172,18 @@ impl Ui {
         }
         l.space(group - gap);
 
-        for (lab, act) in [
-            ("撤销", Action::Undo), ("重做", Action::Redo), ("清空", Action::Clear),
-            ("保存", Action::Save), ("冻结", Action::Freeze), ("鼠标", Action::MouseMode),
-            ("帮助", Action::Help), ("退出", Action::Exit),
-        ] {
-            l.label(lab, s(50), act);
-        }
+        // 编辑操作。
+        l.label(st.undo, s(46), Action::Undo);
+        l.label(st.redo, s(46), Action::Redo);
+        l.label(st.clear, s(46), Action::Clear);
+        // 文件 / 视图 / 交互。
+        l.label(st.save, s(46), Action::Save);
+        l.label(st.freeze, s(46), Action::Freeze);
+        l.label(st.mouse, s(46), Action::MouseMode);
+        // 语言切换：按钮显示当前语言短代码，点一下循环到下一种。
+        l.label(lang.short(), s(40), Action::Lang);
+        l.label(st.help, s(46), Action::Help);
+        l.label(st.exit, s(46), Action::Exit);
 
         let total = l.x - gap + pad;
         let panel_x = ox + if total + 8 >= mon_w { 4 } else { (mon_w - total) / 2 };
@@ -153,35 +193,24 @@ impl Ui {
         }
         let panel_h = bh + pad * 2;
 
-        let help = text::card(
-            &[
-                "ScreenInk  屏幕标注",
-                "P 笔  L 线  R 框  O 圆  A 箭  T 字  E 擦",
-                "1-8 换颜色    滚轮 / [ ] 调粗细",
-                "Ctrl+Z 撤销   Ctrl+Y 重做   C 清空",
-                "M 鼠标模式(穿透交互·界面不变)",
-                "点工具条切回绘图   Ctrl+Alt+M 返回",
-                "S 保存   F 冻结屏幕   Ctrl+V 粘贴文字",
-                "H 帮助   Tab 工具条   Esc 退出",
-            ],
-            if scale > 0.82 { 15 } else { 13 },
-            s(12).max(8),
-            s(23).max(18),
-        );
-        let input_hint = text::card(
-            &["输入文字：Enter 确认 · Esc 取消 · Ctrl+V 粘贴"],
-            if scale > 0.82 { 14 } else { 12 },
-            s(9).max(6),
-            s(21).max(17),
-        );
+        let help_lines = st.help_lines(hotkey_label);
+        let help = text::card(&help_lines, help_fs, s(12).max(8), s(23).max(18));
+        let hint = vec![st.input_hint.to_string()];
+        let input_hint = text::card(&hint, hint_fs, s(9).max(6), s(21).max(17));
 
         let m = (14.0 * scale) as i32;
         Ui {
-            x: panel_x, y: oy, w: total, h: panel_h,
+            x: panel_x,
+            y: oy,
+            w: total,
+            h: panel_h,
             help_x: ox + mon_w - help.w - m,
             help_y: oy + mon_h - help.h - m,
-            btns: l.btns, help, input_hint,
-            visible: true, help_visible: true,
+            btns: l.btns,
+            help,
+            input_hint,
+            visible: true,
+            help_visible: true,
         }
     }
 
@@ -218,6 +247,7 @@ impl Ui {
                 Action::Freeze => st.frozen,
                 // 鼠标模式下工具条照常显示，用高亮表明当前处于穿透态
                 Action::MouseMode => st.mouse_mode,
+                // 语言 / 帮助 / 退出等按钮没有选中态。
                 _ => false,
             };
             let bg = if sel {

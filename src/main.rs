@@ -2,13 +2,15 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod capture;
+mod i18n;
 mod png;
 mod raster;
 mod text;
 mod ui;
 
+use crate::i18n::Lang;
 use crate::raster::{solid, Canvas, Color, Shape};
-use crate::ui::{Action, State, Tool, Ui, COLOR_NAMES, COLORS, TEXT_SIZES, WIDTHS};
+use crate::ui::{Action, State, Tool, Ui, COLORS, TEXT_SIZES, WIDTHS};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
@@ -33,8 +35,11 @@ const VK_OEM_4: u32 = 0xDB; // [
 const VK_OEM_6: u32 = 0xDD; // ]
 const CF_UNICODETEXT: u32 = 13;
 const HIT_BASE: Color = 0x0200_0000; // alpha=2：让整屏可命中鼠标，视觉上近乎全透明
-const HTTRANSPARENT: LRESULT = -1; // 鼠标继续交给 Z 序里下面的窗口
-const HTCLIENT: LRESULT = 1;       // 鼠标由本窗口接收
+const GWL_EXSTYLE: i32 = -20;
+/// 只读查询：返回 1 表示当前处于鼠标模式（供自动化验证使用）
+const WM_APP_GET_MODE: u32 = 0x8000 + 1;
+/// 只读查询：返回已注册成功的全局热键位掩码（bit0=Ctrl+Alt+M, bit1=Ctrl+Alt+N）
+const WM_APP_GET_HOTKEYS: u32 = 0x8000 + 2;
 const HK_MOD_CTRL_ALT_NOREPEAT: u32 = 0x0002 | 0x0001 | 0x4000;
 const VK_M: u32 = 0x4D;
 const VK_N: u32 = 0x4E;
@@ -106,13 +111,20 @@ struct App {
     tool: Tool,
     color: usize,
     width: usize,
+    /// 当前界面语言。
+    lang: Lang,
+    /// 主屏在虚拟桌面缓冲中的位置与尺寸 (ox, oy, mon_w, mon_h)，切换语言重建 UI 时复用。
+    mon: (i32, i32, i32, i32),
     ui: Ui,
     drag: Option<Drag>,
     text_input: Option<TextInput>,
     status: Option<raster::Bitmap>,
     /// true = 鼠标穿透模式：鼠标交给下面的桌面软件，标注层只负责显示
     mouse_mode: bool,
-    hotkey_id: i32,
+    /// 当前窗口是否带 WS_EX_TRANSPARENT，避免重复改样式
+    transparent_on: bool,
+    /// 所有成功注册的全局热键 id，任意一个都能从穿透态返回
+    hotkey_ids: Vec<i32>,
     hotkey_label: String,
     hotkey_ok: bool,
 }
@@ -133,6 +145,24 @@ impl App {
     fn cur_color(&self) -> Color {
         let (r, g, b) = COLORS[self.color];
         solid(r, g, b)
+    }
+
+    /// 当前语言的字符串表。
+    fn t(&self) -> &'static i18n::Strings {
+        i18n::strings(self.lang)
+    }
+
+    /// 切到下一种语言：换字体、按相同几何重建工具条 / 帮助卡片，并保留显隐状态。
+    fn cycle_language(&mut self) {
+        self.lang = self.lang.next();
+        text::set_lang_font(self.lang);
+        let (ox, oy, mw, mh) = self.mon;
+        let visible = self.ui.visible;
+        let help_visible = self.ui.help_visible;
+        self.ui = Ui::new(ox, oy, mw, mh, &self.hotkey_label, self.lang);
+        self.ui.visible = visible;
+        self.ui.help_visible = help_visible;
+        self.flash(self.lang.name());
     }
 
     fn redraw(&mut self) {
@@ -162,7 +192,7 @@ impl App {
         }
         if let Some(ti) = &self.text_input {
             let s = String::from_utf16_lossy(&ti.buf);
-            let disp: String = if s.is_empty() { "在这里输入文字…".into() } else { s };
+            let disp: String = if s.is_empty() { self.t().placeholder.to_string() } else { s };
             let (r, g, b) = COLORS[self.color];
             let bmp = text::render(&disp, TEXT_SIZES[self.width], r, g, b);
             let bw = bmp.w.max(180) + 24;
@@ -258,18 +288,43 @@ impl App {
         }
     }
 
-    /// 鼠标模式下的命中测试：画布（含所有标注）返回 HTTRANSPARENT 交给下层窗口，
-    /// 顶部工具条返回 HTCLIENT 保持可点击 —— 点任意绘图按钮即可回到绘图模式。
-    /// 不再用 WS_EX_TRANSPARENT，因为那是整窗开关，会把工具条一起穿透掉。
-    fn nchittest(&self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-        if !self.mouse_mode {
-            return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+    /// 整窗穿透开关。WS_EX_TRANSPARENT 是系统级样式，跨进程也能把鼠标真正交给
+    /// 下面的窗口（实测 WM_NCHITTEST 返回 HTTRANSPARENT 只会把点击吞掉，不可用）。
+    fn set_transparent(&mut self, on: bool) {
+        if self.transparent_on == on {
+            return;
         }
-        // WM_NCHITTEST 的 lparam 是屏幕坐标，转成客户区坐标再判工具条
-        let (sx, sy) = mouse_xy(lp);
-        let mut pt = POINT { x: sx, y: sy };
-        unsafe { ScreenToClient(self.hwnd, &mut pt) };
-        if self.ui.panel_hit(pt.x, pt.y) { HTCLIENT } else { HTTRANSPARENT }
+        unsafe {
+            let mut ex = GetWindowLongW(self.hwnd, GWL_EXSTYLE) as u32;
+            if on {
+                ex |= WS_EX_TRANSPARENT;
+            } else {
+                ex &= !WS_EX_TRANSPARENT;
+            }
+            SetWindowLongW(self.hwnd, GWL_EXSTYLE, ex as i32);
+            SetWindowPos(
+                self.hwnd,
+                null_mut(),
+                0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+        self.transparent_on = on;
+    }
+
+    /// 光标在工具条上：临时取消穿透，让工具条可以点（点绘图按钮即切回）。
+    /// 光标离开工具条：立刻恢复整窗穿透，画布（含标注）全部交给桌面软件。
+    fn sync_transparency(&mut self) {
+        if !self.mouse_mode {
+            return;
+        }
+        let mut pt = POINT { x: 0, y: 0 };
+        unsafe {
+            GetCursorPos(&mut pt);
+            ScreenToClient(self.hwnd, &mut pt);
+        }
+        let over_bar = self.ui.panel_hit(pt.x, pt.y);
+        self.set_transparent(!over_bar);
     }
 
     /// 从穿透态回到绘图模式（点击工具条 / 全局热键 / 再点「鼠标」都走这里）。
@@ -278,17 +333,16 @@ impl App {
             return;
         }
         self.mouse_mode = false;
-        unsafe { SetForegroundWindow(self.hwnd) };
-        self.flash("已返回标注模式");
+        unsafe {
+            KillTimer(self.hwnd, 2);
+            SetForegroundWindow(self.hwnd);
+        }
+        self.set_transparent(false);
+        self.flash(self.t().back_to_ink);
     }
 
-    /// 鼠标模式开关。
+    /// 鼠标模式开关。工具条在穿透态仍可点，所以不依赖全局热键一定能注册成功。
     fn toggle_mouse_mode(&mut self) {
-        if !self.hotkey_ok {
-            self.flash("全局热键被占用，无法安全切换鼠标模式");
-            self.redraw();
-            return;
-        }
         // 收尾当前操作，别把半截笔画或未确认的文字带进穿透态
         if let Some(d) = self.drag.take() {
             unsafe { ReleaseCapture() };
@@ -306,7 +360,13 @@ impl App {
             self.mouse_mode = true;
             // 冻结底图是静态截图，穿透后会让桌面看起来"卡住"，进入鼠标模式时自动解冻
             self.background = None;
-            let msg = format!("鼠标模式 · 点工具条切回绘图 · {} 返回", self.hotkey_label);
+            self.sync_transparency();
+            unsafe { SetTimer(self.hwnd, 2, 30, None) };
+            let msg = if self.hotkey_ok {
+                self.t().mouse_hotkey.replace("{hk}", &self.hotkey_label)
+            } else {
+                self.t().mouse_no_hotkey.to_string()
+            };
             self.flash(&msg);
         }
         self.redraw();
@@ -342,8 +402,8 @@ impl App {
         out.overlay(&self.ink);
         let path = default_save_path();
         let msg = match png::save(&path, self.w, self.h, &out.px) {
-            Ok(_) => format!("已保存  {}", path.display()),
-            Err(e) => format!("保存失败  {}", e),
+            Ok(_) => self.t().saved.replace("{path}", &path.display().to_string()),
+            Err(e) => self.t().save_failed.replace("{path}", &e.to_string()),
         };
         self.flash(&msg);
         self.redraw();
@@ -409,6 +469,10 @@ impl App {
             Action::Freeze => self.toggle_freeze(),
             Action::MouseMode => {
                 self.toggle_mouse_mode();
+                return;
+            }
+            Action::Lang => {
+                self.cycle_language();
                 return;
             }
             Action::Help => self.ui.help_visible = !self.ui.help_visible,
@@ -584,11 +648,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
     let a = &mut *APP;
     match msg {
-        // 选择性穿透：画布交给下层窗口，工具条留给自己点
-        WM_NCHITTEST => a.nchittest(hwnd, msg, wp, lp),
+        // 只读状态查询，供自动化验证
+        WM_APP_GET_MODE => if a.mouse_mode { 1 } else { 0 },
+        WM_APP_GET_HOTKEYS => {
+            a.hotkey_ids.iter().fold(0i32, |m, id| m | (1 << (id - 1))) as LRESULT
+        }
         // 全局热键只负责"从穿透态返回"：标注模式下忽略，避免系统里残留的
         // 热键事件 / 别的进程抢注后误把工具切进鼠标模式。
-        WM_HOTKEY if wp as i32 == a.hotkey_id => {
+        WM_HOTKEY if a.hotkey_ids.contains(&(wp as i32)) => {
             if a.mouse_mode { a.toggle_mouse_mode(); }
             0
         }
@@ -597,10 +664,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let (x, y) = mouse_xy(lp);
             if a.mouse_mode {
                 a.leave_mouse_mode();
-                // 点在工具条空白处只退出穿透态，不要顺手落下一笔
-                if a.ui.hit(x, y).is_none() {
-                    a.redraw();
-                    return 0;
+                // 点空白：只退出，不落笔。点「鼠标」按钮：也只退出，
+                // 否则 do_action 会把它当成"再切一次"又回到穿透态。
+                match a.ui.hit(x, y) {
+                    None | Some(Action::MouseMode) => { a.redraw(); return 0; }
+                    _ => {}
                 }
             }
             a.on_down(x, y);
@@ -624,6 +692,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             a.redraw();
             0
         }
+        WM_TIMER if wp == 2 => { a.sync_transparency(); 0 }
         WM_DESTROY => { PostQuitMessage(0); 0 }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
@@ -688,16 +757,26 @@ unsafe fn run() {
     SelectObject(memdc, hbmp);
 
     let (ox, oy, mw, mh) = primary_monitor(vx, vy);
-    // 全局热键：穿透后窗口失去键盘焦点，只有它能把模式切回来。
-    // 主备两个组合，避免被其它软件占用时彻底锁死在穿透态。
-    let (hotkey_id, hotkey_label, hotkey_ok) =
-        if RegisterHotKey(hwnd, 1, HK_MOD_CTRL_ALT_NOREPEAT, VK_M) != 0 {
-            (1i32, "Ctrl+Alt+M".to_string(), true)
-        } else if RegisterHotKey(hwnd, 2, HK_MOD_CTRL_ALT_NOREPEAT, VK_N) != 0 {
-            (2i32, "Ctrl+Alt+N".to_string(), true)
-        } else {
-            (0i32, "Ctrl+Alt+M".to_string(), false)
-        };
+    // 启动按 Windows UI 语言选界面语言（识别不到回退英文），并同步正文字体。
+    let lang = Lang::detect();
+    text::set_lang_font(lang);
+    // 两个全局热键都注册，任意一个都能从穿透态返回。之前只注册一个、
+    // 被占用时才换备用，用户按帮助里写的 M 会毫无反应 —— 这正是"切不回来"的根因。
+    // 即便两个都被占用，工具条在穿透态仍可点，不会锁死。
+    let mut hotkey_ids: Vec<i32> = Vec::new();
+    if RegisterHotKey(hwnd, 1, HK_MOD_CTRL_ALT_NOREPEAT, VK_M) != 0 {
+        hotkey_ids.push(1);
+    }
+    if RegisterHotKey(hwnd, 2, HK_MOD_CTRL_ALT_NOREPEAT, VK_N) != 0 {
+        hotkey_ids.push(2);
+    }
+    let hotkey_ok = !hotkey_ids.is_empty();
+    let hotkey_label = match (hotkey_ids.contains(&1), hotkey_ids.contains(&2)) {
+        (true, true) => "Ctrl+Alt+M / N".to_string(),
+        (true, false) => "Ctrl+Alt+M".to_string(),
+        (false, true) => "Ctrl+Alt+N".to_string(),
+        (false, false) => i18n::strings(lang).click_toolbar.to_string(),
+    };
 
     let app = Box::new(App {
         hwnd, memdc, hbmp, bits: bits as *mut Color, w, h, vx, vy,
@@ -710,12 +789,15 @@ unsafe fn run() {
         tool: Tool::Pen,
         color: 0,
         width: 1,
-        ui: Ui::new(ox, oy, mw, mh),
+        lang,
+        mon: (ox, oy, mw, mh),
+        ui: Ui::new(ox, oy, mw, mh, &hotkey_label, lang),
         drag: None,
         text_input: None,
         status: None,
         mouse_mode: false,
-        hotkey_id,
+        transparent_on: false,
+        hotkey_ids,
         hotkey_label,
         hotkey_ok,
     });
@@ -725,7 +807,8 @@ unsafe fn run() {
     SetForegroundWindow(hwnd);
     (*APP).redraw();
     if !hotkey_ok {
-        (*APP).flash("全局热键被占用，鼠标模式不可用");
+        let msg = (*APP).t().hotkey_busy.to_string();
+        (*APP).flash(&msg);
         (*APP).redraw();
     }
 
@@ -734,8 +817,8 @@ unsafe fn run() {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    if (*APP).hotkey_ok {
-        UnregisterHotKey(hwnd, (*APP).hotkey_id);
+    for id in &(*APP).hotkey_ids {
+        UnregisterHotKey(hwnd, *id);
     }
     DestroyWindow(hwnd);
     let a = Box::from_raw(APP);
@@ -744,51 +827,47 @@ unsafe fn run() {
     DeleteObject(a.hbmp);
 }
 
-/// 自检：不弹窗口，直接把图元 / 中文 / 工具条渲染成 PNG，便于验证渲染管线。
+/// 自检：不弹窗口，把 7 种语言的工具条 / 帮助卡片 / 多语言字形渲染成一张 PNG，
+/// 用于验证 i18n 文案、字体回退与布局宽度（长词不溢出、无缺字方块）。
 fn selftest() {
-    let (w, h) = (1400i32, 820i32);
+    let (w, h) = (1400i32, 900i32);
     let mut c = Canvas::new(w, h);
     c.fill_rect(0, 0, w, h, solid(246, 247, 250));
 
-    let red = solid(255, 59, 48);
-    let blue = solid(10, 132, 255);
-    let green = solid(52, 199, 89);
-
-    let t = text::render("ScreenInk 屏幕标注 · 中文渲染测试 ABC 123", 32, 28, 32, 42);
-    c.stamp(60, 60, &t);
-    let t2 = text::render("电力工程 · 接线示意图 / 设备标注 / 尺寸注释", 22, 90, 96, 110);
-    c.stamp(60, 108, &t2);
-
-    // 自由画笔曲线
-    let pts: Vec<(f32, f32)> = (0..120)
-        .map(|i| {
-            let x = 60.0 + i as f32 * 4.0;
-            (x, 200.0 + (i as f32 * 0.16).sin() * 40.0)
-        })
-        .collect();
-    Shape::Pen { color: red, width: 6.0, pts }.raster(&mut c);
-
-    Shape::Line { color: blue, width: 4.0, a: (60.0, 300.0), b: (420.0, 340.0) }.raster(&mut c);
-    Shape::Rect { color: green, width: 4.0, a: (60.0, 380.0), b: (300.0, 500.0) }.raster(&mut c);
-    Shape::Ellipse { color: solid(191, 90, 242), width: 5.0, a: (340.0, 380.0), b: (600.0, 500.0) }.raster(&mut c);
-    Shape::Arrow { color: solid(255, 149, 0), width: 5.0, a: (620.0, 500.0), b: (880.0, 320.0) }.raster(&mut c);
-
-    for (i, (r, g, b)) in COLORS.iter().enumerate() {
-        let x = 60 + i as i32 * 90;
-        c.segment(x as f32, 560.0, (x + 70) as f32, 560.0, 10.0, solid(*r, *g, *b));
-        let lab = text::render(COLOR_NAMES[i], 16, 70, 76, 88);
-        c.stamp(x, 575, &lab);
-    }
-
-    c.disc(980.0, 430.0, 70.0, solid(10, 132, 255));
-    c.erase_disc(1010.0, 430.0, 55.0);
-    let t3 = text::render("← 橡皮擦除效果", 18, 70, 76, 88);
-    c.stamp(920, 520, &t3);
+    text::set_lang_font(Lang::En);
+    let title = text::render("ScreenInk self-test — 7-language toolbars & font coverage", 26, 28, 32, 42);
+    c.stamp(40, 22, &title);
+    // 一条涵盖各语言特殊字符的样本，验证 GDI 字体链接的跨字体回退。
+    let sample = text::render("简繁 日本語 あア漢 Deutsch Español Français · ñ é è ö ü ß", 18, 90, 96, 110);
+    c.stamp(40, 62, &sample);
 
     let st = State { tool: Tool::Pen, color: 5, width: 1, frozen: false, mouse_mode: false };
-    let ui = Ui::new(0, 0, w, h);
-    ui.draw(&mut c, &st);
-    ui.draw_help(&mut c);
+    let hk = "Ctrl+Alt+M / N";
+    let row_h = 76i32;
+    let top = 110i32;
+    // 每种语言先切到对应字体再构建工具条，逐行叠放以便一眼比较宽度与字形。
+    for (i, lang) in Lang::ALL.iter().enumerate() {
+        text::set_lang_font(*lang);
+        let oy = top + i as i32 * row_h;
+        let ui = Ui::new(0, oy, w, row_h, hk, *lang);
+        ui.draw(&mut c, &st);
+    }
+
+    // 英文 9 行帮助卡片，验证多行卡片布局与 {hk} 占位符替换。
+    text::set_lang_font(Lang::En);
+    let en = i18n::strings(Lang::En);
+    let help = text::card(&en.help_lines(hk), 15, 12, 23);
+    let help_y = top + Lang::ALL.len() as i32 * row_h + 10;
+    c.stamp(40, help_y, &help);
+
+    // 8 色色板 + 英文名，验证颜色名翻译管线。
+    for (i, (r, g, b)) in COLORS.iter().enumerate() {
+        let x = 720 + i as i32 * 82;
+        c.disc(x as f32, help_y as f32 + 18.0, 13.0, solid(*r, *g, *b));
+        let lab = text::render(en.colors[i], 15, 70, 76, 88);
+        c.stamp(x - 8, help_y + 34, &lab);
+    }
+
     let p = std::env::current_dir().unwrap().join("selftest.png");
     png::save(&p, w, h, &c.px).expect("png save failed");
 }

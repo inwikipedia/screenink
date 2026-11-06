@@ -1,75 +1,80 @@
-# ScreenInk 屏幕标注
+# ScreenInk — Screen Annotation
 
-Windows 单文件屏幕标注 / 绘制工具。纯 Rust + [`windows-sys`](https://crates.io/crates/windows-sys) 实现，自绘全屏叠层，无第三方 GUI 框架、无需安装，一个 exe 直接运行。
+**English** · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Español](README.es.md) · [Français](README.fr.md)
 
-![ScreenInk 预览](preview.png)
+A single-file screen annotation / drawing tool for Windows. Written in pure Rust with [`windows-sys`](https://crates.io/crates/windows-sys), it draws its own full-screen overlay — no third-party GUI framework, no installer, just one executable.
 
-## 功能特性
+![ScreenInk preview](preview.png)
 
-- **全屏叠层标注**：覆盖整个虚拟桌面，支持多显示器，标注时不影响下层界面
-- **七种工具**：自由画笔、直线、矩形、椭圆、箭头、文字、橡皮
-- **8 种颜色 × 3 档粗细**，文字另有 3 档字号，输入时支持 `Ctrl+V` 粘贴
-- **撤销 / 重做 / 清空**，最多保留 50 步历史
-- **冻结屏幕（F）**：先抓取静态截图再在上面标注，适合对着动态画面讲解
-- **鼠标穿透模式（M）**：把鼠标交还给下层软件正常操作，随时用全局热键或点工具条返回
-- **一键保存 PNG** 到桌面，文件名带时间戳
-- **单文件、静态链接 CRT**：不依赖 VC++ 运行库，体积小，拷走即用
+## Features
 
-## 快捷键
+- **Full-screen overlay annotation** covering the entire virtual desktop (multi-monitor aware) without disturbing the windows underneath
+- **Seven tools**: freehand pen, straight line, rectangle, ellipse, arrow, text, eraser
+- **8 colors × 3 stroke widths**; text offers 3 font sizes and supports pasting with `Ctrl+V`
+- **Undo / redo / clear**, keeping up to 50 history steps
+- **Freeze screen (`F`)**: capture a still frame and annotate on top of it — handy for explaining dynamic content
+- **Mouse click-through mode (`M`)**: hand input back to the app below; return anytime via the global hotkey or the toolbar
+- **7-language interface**: English, 简体中文, 繁體中文, 日本語, Deutsch, Español, Français. The Windows UI language is detected at startup (falling back to English); switch any time with the language button on the toolbar
+- **One-click PNG save** to your Desktop with a timestamped filename
+- **Single file, statically linked CRT** — no VC++ runtime dependency, small footprint, copy-and-run
 
-| 分类 | 按键 | 功能 |
+## Shortcuts
+
+| Category | Key | Action |
 | --- | --- | --- |
-| 工具 | `P` `L` `R` `O` `A` `T` `E` | 笔 / 线 / 框 / 圆 / 箭 / 字 / 擦 |
-| 颜色 | `1` – `8` | 切换 8 种颜色 |
-| 粗细 | 鼠标滚轮 或 `[` `]` | 调小 / 调大笔触 |
-| 编辑 | `Ctrl+Z` / `Ctrl+Y` / `C` | 撤销 / 重做 / 清空 |
-| 文件 | `S`（或 `Ctrl+S`） | 保存 PNG 到桌面 |
-| 视图 | `F` | 冻结 / 解冻屏幕 |
-| 穿透 | `M` | 鼠标模式开关 |
-| 返回 | `Ctrl+Alt+M` / `Ctrl+Alt+N` | 全局热键，从穿透态返回绘图 |
-| 其他 | `H` / `F1` | 帮助卡片显隐 |
-| 其他 | `Tab` | 工具条显隐 |
-| 文字 | `Enter` / `Esc` / `Ctrl+V` | 确认 / 取消 / 粘贴 |
-| 退出 | `Esc` | 退出程序 |
+| Tools | `P` `L` `R` `O` `A` `T` `E` | Pen / Line / Box / Oval / Arrow / Text / Eraser |
+| Color | `1` – `8` | Switch among the 8 colors |
+| Width | Mouse wheel or `[` `]` | Decrease / increase stroke width |
+| Editing | `Ctrl+Z` / `Ctrl+Y` / `C` | Undo / redo / clear |
+| File | `S` (or `Ctrl+S`) | Save a PNG to the Desktop |
+| View | `F` | Freeze / unfreeze the screen |
+| Click-through | `M` | Toggle mouse mode |
+| Return | `Ctrl+Alt+M` / `Ctrl+Alt+N` | Global hotkey to leave mouse mode and return to drawing |
+| Other | `H` / `F1` | Toggle the help card |
+| Other | `Tab` | Toggle the toolbar |
+| Text | `Enter` / `Esc` / `Ctrl+V` | Confirm / cancel / paste |
+| Language | Toolbar language button | Cycle through the 7 interface languages |
+| Exit | `Esc` | Quit the program |
 
-## 使用
+## Usage
 
-直接双击运行 `ScreenInk.exe`，即可在屏幕上开始标注；按 `Esc` 退出。保存的图片位于**桌面**，文件名形如 `ScreenInk_20261105_173000.png`。
+Double-click `ScreenInk.exe` and start annotating; press `Esc` to quit. Saved images go to your **Desktop** with names like `ScreenInk_20261105_173000.png`.
 
-## 从源码构建
+## Build from source
 
-需要 Rust 工具链（MSVC 目标）：
+Requires the Rust toolchain (MSVC target):
 
 ```bash
 cargo build --release
 ```
 
-产物在 `target/release/screenink.exe`（仓库根目录的 `ScreenInk.exe` 是改名后的副本）。`.cargo/config.toml` 已开启 `+crt-static` 静态链接，release profile 针对体积优化（LTO + `opt-level="z"` + `strip`）。
+The binary is at `target/release/screenink.exe` (the `ScreenInk.exe` in the repo root is a renamed copy). `.cargo/config.toml` enables `+crt-static` for a static CRT, and the release profile is tuned for size (LTO + `opt-level="z"` + `strip`).
 
-渲染管线自检（不弹窗，直接输出 `selftest.png`）：
+Render-pipeline self-check (no window; writes `selftest.png`, including all 7 localized toolbars):
 
 ```bash
 cargo run -- --selftest
 ```
 
-## 项目结构
+## Project structure
 
-| 文件 | 职责 |
+| File | Responsibility |
 | --- | --- |
-| `src/main.rs` | 窗口创建、消息循环、全局热键与交互编排 |
-| `src/ui.rs` | 自绘顶部工具条与帮助卡片 |
-| `src/raster.rs` | 像素缓冲、画布与图元光栅化 |
-| `src/capture.rs` | 屏幕抓取（冻结底图） |
-| `src/text.rs` | 文字渲染 |
-| `src/png.rs` | PNG 编码与保存 |
+| `src/main.rs` | Window creation, message loop, global hotkeys, interaction orchestration |
+| `src/i18n.rs` | Language enum and the 7-language string tables |
+| `src/ui.rs` | Self-drawn top toolbar and help card |
+| `src/raster.rs` | Pixel buffer, canvas and shape rasterization |
+| `src/capture.rs` | Screen capture (frozen background) |
+| `src/text.rs` | GDI text rendering with per-language fonts |
+| `src/png.rs` | PNG encoding and saving |
 
-## 💛 捐赠支持
+## 💛 Support development
 
-ScreenInk 是免费开源软件。如果它确实帮到了你的工作，欢迎请作者喝杯咖啡 ☕。
+ScreenInk is free and open source. If it genuinely helps your work, consider buying me a coffee ☕.
 
 <div align="center">
-  <img src="支付宝赞赏二维码.jpg" alt="支付宝赞赏二维码" width="240" />
-  <p>使用 <b>支付宝</b> 扫码赞赏</p>
+  <img src="支付宝赞赏二维码.jpg" alt="Alipay tip QR code" width="240" />
+  <p>Scan with <b>Alipay</b> to leave a tip</p>
 </div>
 
-> 赞赏完全自愿，不影响任何功能使用。感谢你的支持与鼓励！
+> Tipping is entirely voluntary and never affects any functionality. Thank you for your support and encouragement!
